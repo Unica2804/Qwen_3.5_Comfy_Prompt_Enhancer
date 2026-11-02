@@ -246,28 +246,6 @@ tokenizer.py     chat tokenisation via the checkpoint's own Jinja template
 sampler.py       greedy / temperature / top-k / top-p
 nodes.py         the ComfyUI node, model cache, VRAM handling
 kernels/         Triton kernels (gemm, w4, norm, attention, linear_attn, common)
-.dev/            parity tests, benchmarks, profilers (git-ignored, dev only)
-```
-
-## Tests
-
-The harness lives in `.dev/` (git-ignored, so only present in a development
-checkout — the node itself needs none of it). Run it with the embedded
-interpreter:
-
-```powershell
-$py = "D:\ComfyUI_windows_portable_nvidia\ComfyUI_windows_portable\python_embeded\python.exe"
-& $py test_kernels.py      # per-kernel parity vs torch reference (W8 path)
-& $py test_fused.py        # fused kernels vs unfused composition (bit-exact)
-& $py test_w4.py           # W4 kernels vs torch reference (packed int4)
-& $py verify_w4_load.py    # loaded tensors bit-identical to the checkpoint
-& $py test_quality.py ref  # dump HF reference logits (once)
-& $py test_quality.py check# teacher-forced agreement / cosine / KL
-& $py parity_w4.py         # 2B: per-position + per-decode-step parity vs HF
-& $py bench_both.py        # prefill + decode throughput, both models
-& $py bench_e2b.py [dir]   # per-kernel profile of one decode step
-& $py test_node.py         # node end-to-end, both models, both memory modes
-& $py test_api.py          # same, through a live ComfyUI /prompt API
 ```
 
 All kernels match the torch reference to bf16 rounding (`rel_l2 ≈ 1.7e-3`);
