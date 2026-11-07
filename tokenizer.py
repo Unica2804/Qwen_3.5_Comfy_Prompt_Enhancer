@@ -50,8 +50,42 @@ class ChatTokenizer:
         text = self.render_prompt(system_prompt, user_text, enable_thinking)
         return self.tok.encode(text).ids
 
+    def encode_chat_prefix_len(self, system_prompt, ids):
+        """Length of the system-turn prefix within an `encode_chat` id list.
+
+        The prefix is everything up to the start of the user turn, so the
+        engine can snapshot the state after the (expensive, identical) system
+        prompt and restore it instead of re-running it.  Falls back to the
+        end of the system turn (the first `<|im_end|>`) if BPE boundary
+        effects make the empty-user render differ from a prefix of the full
+        encoding.
+        """
+        if not system_prompt:
+            return 0
+        pre = self.tok.encode(self.render_prompt(system_prompt, "")).ids
+        if len(pre) <= len(ids) and ids[: len(pre)] == pre:
+            return len(pre)
+        end = self.tok.token_to_id("<|im_end|>")
+        if end is not None and ids:
+            for i, t in enumerate(ids):
+                if t == end:
+                    return i + 1
+        return 0
+
     def encode(self, text):
         return self.tok.encode(text).ids
+
+    def token_to_id(self, token):
+        """Token id for a literal string (e.g. a newline).
+
+        `Tokenizer.token_to_id` looks up byte-mapped vocab entries ("Ċ"), so
+        it misses "\n"/" " literals; fall back to a single-token encode.
+        """
+        tid = self.tok.token_to_id(token)
+        if tid is not None:
+            return tid
+        enc = self.tok.encode(token).ids
+        return enc[0] if len(enc) == 1 else None
 
     def decode(self, ids):
         return self.tok.decode(ids, skip_special_tokens=True)

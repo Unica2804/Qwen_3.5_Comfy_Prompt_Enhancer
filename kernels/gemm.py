@@ -58,7 +58,7 @@ def gemm_i8_kernel(A, AS, B, BS, C, M, N, K, NG,
 
 
 def gemm_i8(a_q, a_s, b, b_s, out, residual=None, block_m=None, block_n=None, block_k=64,
-            group_m=8):
+            group_m=8, b_z=None):
     """out[M,N] (bf16) = (a_q * a_s) @ (b * b_s), optional residual add.
 
     `b` is int8 [K,N] with one scale per output row (W8A16 checkpoints), or uint8
@@ -67,8 +67,9 @@ def gemm_i8(a_q, a_s, b, b_s, out, residual=None, block_m=None, block_n=None, bl
 
     a_s holds one scale per GROUP of K (shape [M, K//GROUP])."""
     if _is_w4(b):
-        return gemm_w4(a_q, a_s, b, b_s, out, residual=residual, block_m=block_m,
-                       block_n=block_n, block_k=block_k, group_m=group_m)
+        return gemm_w4(a_q, a_s, b, b_s, out, residual=residual, b_z=b_z,
+                       block_m=block_m, block_n=block_n, block_k=block_k,
+                       group_m=group_m)
     M, K = a_q.shape
     N = b.shape[1]
     if block_m is None:
@@ -210,11 +211,12 @@ def mlp_gate_up_quant_kernel(A, AS, BG, BSG, BU, BSU, Q, QS, M, N, K, NG,
              mask=m_mask[:, None])
 
 
-def mlp_gate_up_quant(a_q, a_s, wg, wsg, wu, wsu, out_q, out_s, block_k=64):
+def mlp_gate_up_quant(a_q, a_s, wg, wsg, wu, wsu, out_q, out_s, block_k=64,
+                      zg=None, zu=None):
     """Fused gate/up MLP + int8 quantisation of the activation (the down_proj input)."""
     if _is_w4(wg):
         return mlp_gate_up_quant_w4(a_q, a_s, wg, wsg, wu, wsu, out_q, out_s,
-                                    block_k=block_k)
+                                    zg=zg, zu=zu, block_k=block_k)
     M, K = a_q.shape
     N = wg.shape[1]
     block_m = 16 if M <= 16 else (32 if M <= 64 else 64)
@@ -285,9 +287,11 @@ def proj3_kernel(A, AS, B1, S1, B2, S2, B3, S3, C, M, N1, N2, N3, K, NG, stride_
              mask=m_mask[:, None] & n_mask[None, :])
 
 
-def proj3(a_q, a_s, w1, s1, w2, s2, w3, s3, out, block_k=64):
+def proj3(a_q, a_s, w1, s1, w2, s2, w3, s3, out, block_k=64, z1=None, z2=None,
+          z3=None):
     if _is_w4(w1):
-        return proj3_w4(a_q, a_s, w1, s1, w2, s2, w3, s3, out, block_k=block_k)
+        return proj3_w4(a_q, a_s, w1, s1, w2, s2, w3, s3, out, block_k=block_k,
+                        z1=z1, z2=z2, z3=z3)
     M, K = a_q.shape
     n1 = w1.shape[1] if w1 is not None else 0
     n2 = w2.shape[1] if w2 is not None else 0

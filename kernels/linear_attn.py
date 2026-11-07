@@ -9,7 +9,8 @@ from .common import silu
 
 @triton.jit
 def conv_silu_kernel(X, W, STATE, Y, T, C, KS: tl.constexpr, stride_x,
-                     BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr):
+                     BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
+                     BATCH: tl.constexpr):
     pt = tl.program_id(0)
     pc = tl.program_id(1)
     offs_t = pt * BLOCK_T + tl.arange(0, BLOCK_T)
@@ -17,10 +18,19 @@ def conv_silu_kernel(X, W, STATE, Y, T, C, KS: tl.constexpr, stride_x,
     cmask = offs_c < C
     acc = tl.zeros((BLOCK_T, BLOCK_C), tl.float32)
     for j in tl.static_range(KS):
-        src = offs_t - (KS - 1) + j
-        xa = tl.load(X + src[:, None] * stride_x + offs_c[None, :],
+        if BATCH:
+            # per-row timeline: history taps read the row's own state rows,
+            # the current tap (last j) reads the row's own input row
+            src = j - (KS - 1)
+            x_row = offs_t
+            st_row = offs_t * (KS - 1) + j
+        else:
+            src = offs_t - (KS - 1) + j
+            x_row = src
+            st_row = (KS - 1 + src)
+        xa = tl.load(X + x_row[:, None] * stride_x + offs_c[None, :],
                      mask=(src >= 0)[:, None] & cmask[None, :], other=0.0).to(tl.float32)
-        xs = tl.load(STATE + (KS - 1 + src)[:, None] * C + offs_c[None, :],
+        xs = tl.load(STATE + st_row[:, None] * C + offs_c[None, :],
                      mask=(src < 0)[:, None] & cmask[None, :], other=0.0).to(tl.float32)
         x = tl.where((src >= 0)[:, None], xa, xs)
         w = tl.load(W + offs_c * KS + j, mask=cmask, other=0.0).to(tl.float32)
@@ -29,33 +39,48 @@ def conv_silu_kernel(X, W, STATE, Y, T, C, KS: tl.constexpr, stride_x,
              mask=(offs_t < T)[:, None] & cmask[None, :])
 
 
-def conv_silu(x, w, state, y, T):
+def conv_silu(x, w, state, y, T, batch=False):
     C = x.shape[1]
     conv_silu_kernel[(triton.cdiv(T, 16), triton.cdiv(C, 128))](
-        x, w, state, y, T, C, KS=4, stride_x=x.stride(0), BLOCK_T=16, BLOCK_C=128, num_warps=4)
+        x, w, state, y, T, C, KS=4, stride_x=x.stride(0), BLOCK_T=16, BLOCK_C=128,
+        BATCH=batch, num_warps=4)
     return y
 
 
 @triton.jit
 def conv_state_update_kernel(X, STATE, T, C, KS: tl.constexpr, stride_x,
-                             BLOCK_C: tl.constexpr):
-    """State holds the raw (pre-conv) last KS-1 input rows."""
+                             BLOCK_C: tl.constexpr, BATCH: tl.constexpr):
+    """State holds the raw (pre-conv) last KS-1 input rows.
+
+    Batch mode (one position per batch row): each candidate's state shifts
+    down by one and takes its own input row as the newest.
+    """
     pc = tl.program_id(0)
+    b = tl.program_id(1)
     offs_c = pc * BLOCK_C + tl.arange(0, BLOCK_C)
     cmask = offs_c < C
-    for j in tl.static_range(KS - 1):
-        # new state row j = input row T-(KS-1)+j  (may come from the old state if T is short)
-        src = T - (KS - 1) + j
-        xa = tl.load(X + src * stride_x + offs_c, mask=cmask & (src >= 0), other=0.0)
-        xs = tl.load(STATE + (src + KS - 1) * C + offs_c, mask=cmask & (src < 0), other=0.0)
-        v = tl.where(src >= 0, xa, xs)
-        tl.store(STATE + j * C + offs_c, v, mask=cmask)
+    if BATCH:
+        for j in tl.static_range(KS - 1):
+            if j < KS - 2:
+                v = tl.load(STATE + (b * (KS - 1) + j + 1) * C + offs_c, mask=cmask, other=0.0)
+            else:
+                v = tl.load(X + b * stride_x + offs_c, mask=cmask, other=0.0)
+            tl.store(STATE + (b * (KS - 1) + j) * C + offs_c, v, mask=cmask)
+    else:
+        for j in tl.static_range(KS - 1):
+            # new state row j = input row T-(KS-1)+j  (may come from the old state if T is short)
+            src = T - (KS - 1) + j
+            xa = tl.load(X + src * stride_x + offs_c, mask=cmask & (src >= 0), other=0.0)
+            xs = tl.load(STATE + (src + KS - 1) * C + offs_c, mask=cmask & (src < 0), other=0.0)
+            v = tl.where(src >= 0, xa, xs)
+            tl.store(STATE + j * C + offs_c, v, mask=cmask)
 
 
-def conv_state_update(x, state, T):
+def conv_state_update(x, state, T, batch=1):
     C = x.shape[1]
-    conv_state_update_kernel[(triton.cdiv(C, 256),)](x, state, T, C, KS=4,
-                                                     stride_x=x.stride(0), BLOCK_C=256, num_warps=4)
+    conv_state_update_kernel[(triton.cdiv(C, 256), batch)](
+        x, state, T, C, KS=4, stride_x=x.stride(0), BLOCK_C=256,
+        BATCH=batch > 1, num_warps=4)
 
 
 @triton.jit
@@ -146,23 +171,24 @@ def delta_prefill(qkv, g, beta, state, out, T, vs=32, chunk=32):
 
 @triton.jit
 def delta_decode_kernel(QKV, G, BETA, STATE, OUT, NH: tl.constexpr, DK: tl.constexpr,
-                        DV: tl.constexpr, VS: tl.constexpr):
-    """grid = (NH, DV // VS) for a single new token."""
+                        DV: tl.constexpr, VS: tl.constexpr, B: tl.constexpr):
+    """grid = (NH, DV // VS, B) for one new token per batch row."""
     h = tl.program_id(0)
     vs = tl.program_id(1)
+    b = tl.program_id(2)
     offs_k = tl.arange(0, DK)
     offs_v = tl.arange(0, VS)
 
-    q = tl.load(QKV + h * DK + offs_k).to(tl.float32)
-    k = tl.load(QKV + NH * DK + h * DK + offs_k).to(tl.float32)
-    v = tl.load(QKV + 2 * NH * DK + h * DV + vs * VS + offs_v).to(tl.float32)
-    beta = tl.load(BETA + h)
-    g = tl.load(G + h)
+    q = tl.load(QKV + b * (2 * NH * DK + NH * DV) + h * DK + offs_k).to(tl.float32)
+    k = tl.load(QKV + b * (2 * NH * DK + NH * DV) + NH * DK + h * DK + offs_k).to(tl.float32)
+    v = tl.load(QKV + b * (2 * NH * DK + NH * DV) + 2 * NH * DK + h * DV + vs * VS + offs_v).to(tl.float32)
+    beta = tl.load(BETA + b * NH + h)
+    g = tl.load(G + b * NH + h)
 
     qn = q * tl.rsqrt(tl.sum(q * q) + 1e-6) * (1.0 / tl.sqrt(float(DK)))
     kn = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
 
-    sp = STATE + h * DK * DV + offs_k[:, None] * DV + (vs * VS + offs_v)[None, :]
+    sp = STATE + (b * NH + h) * DK * DV + offs_k[:, None] * DV + (vs * VS + offs_v)[None, :]
     S = tl.load(sp)
     S = S * tl.exp(g)
     kv = tl.sum(kn[:, None] * S, axis=0)
@@ -170,11 +196,12 @@ def delta_decode_kernel(QKV, G, BETA, STATE, OUT, NH: tl.constexpr, DK: tl.const
     S = S + kn[:, None] * delta[None, :]
     out = tl.sum(qn[:, None] * S, axis=0)
     tl.store(sp, S)
-    tl.store(OUT + h * DV + vs * VS + offs_v, out.to(tl.bfloat16))
+    tl.store(OUT + b * NH * DV + h * DV + vs * VS + offs_v, out.to(tl.bfloat16))
 
 
-def delta_decode(qkv, g, beta, state, out, vs=32):
+def delta_decode(qkv, g, beta, state, out, vs=32, batch=1):
     NH, DK, DV = 16, 128, 128
-    delta_decode_kernel[(NH, DV // vs)](qkv, g, beta, state, out,
-                                        NH=NH, DK=DK, DV=DV, VS=vs, num_warps=4)
+    delta_decode_kernel[(NH, DV // vs, batch)](qkv, g, beta, state, out,
+                                               NH=NH, DK=DK, DV=DV, VS=vs,
+                                               B=batch, num_warps=4)
     return out

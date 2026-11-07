@@ -1,20 +1,34 @@
 """Checkpoint loading -> stacked tensors ready for the Triton kernels.
 
-Two quantisation formats are supported:
+Three groups of checkpoint formats are supported for the stacked linear layers:
 
-* **W8A16** — `<proj>.qweight` int8 `[in, out]` + `<proj>.scale` bf16 `[out]`.
-  Weights stay int8 and are used directly by the GEMM.
-* **W4A16 groupwise** — `<proj>.packed_weight` uint8 `[out, in//2]` (even-K in the
-  low nibble, odd-K in the high nibble) + `<proj>.scale` bf16 `[out, in//group]`.
-  Weights stay packed at 4 bits and are expanded to int8 inside the dot loop, so
-  a 2B model keeps 685 MB of weights instead of 1.37 GB.
+* **W8A16** (our own format) — `<proj>.qweight` int8 `[in, out]` + `<proj>.scale`
+  fp32 `[out]`.  Weights stay int8 and are used directly by the GEMM.
+* **W4A16 groupwise** (our own format) — `<proj>.packed_weight` uint8
+  `[out, in//2]` (even-K low nibble / odd-K high nibble) + `<proj>.scale` bf16
+  `[out, in//group]`.  Weights stay packed at 4 bits and are expanded to int8
+  inside the dot loop, so a 2B model keeps 685 MB of weights instead of 1.37 GB.
+* **AWQ / GPTQ / compressed-tensors** (`quantization_config` with a
+  `quant_method` other than ours) — converted at load time into the layouts
+  above; see `quant_formats.py`.  Checkpoints whose stored grid maps directly
+  onto the kernels are repacked bit-exactly (symmetric CT int4 at a supported
+  group size, symmetric GPTQ int4, AutoAWQ asym int4 via the per-group-zero
+  kernel path); anything else is dequantized and requantized (group 16/act-
+  order/asymmetric CT/int8-with-group-scales), which adds one quantisation
+  round on top of the checkpoint's own.
+
+The embedding table is always quantised at load time (int8, per-vocab-row
+scale; W4 head optional via `head_w4=True`, default off) regardless of format.
 """
 import glob
 import json
 import os
 
 import torch
-from safetensors import safe_open
+
+from .quant_formats import (CheckpointReader, convert_proj, plan_engine_kind,
+                            read_quant_config, requant_w4_sym, requant_w8_row,
+                            w4_native)
 
 
 class QwenWeights:
@@ -23,7 +37,8 @@ class QwenWeights:
     def __init__(self, cfg, quant="w8"):
         self.cfg = cfg
         self.quant = quant
-        self.t = {}          # name -> tensor
+        self.has_z = False        # per-group asymmetric zeros present (W4)
+        self.t = {}               # name -> tensor
         self.device = torch.device("cpu")
         self._cpu_backup = None
 
@@ -75,8 +90,8 @@ def _is_qwen35_dir(d):
 def discover_models(roots):
     """Quantised Qwen3.5 checkpoints under `roots` -> [(label, path), ...].
 
-    Labels are the folder name, disambiguated by the parent folder name when two
-    roots contain the same name.
+    Accepts our own W8A16/W4A16 folders as well as AWQ / GPTQ /
+    compressed-tensors folders, sharded or not.
     """
     if isinstance(roots, str):
         roots = [roots]
@@ -100,34 +115,10 @@ def discover_models(roots):
     return out
 
 
-def _pick_ckpt(d):
-    files = sorted(glob.glob(os.path.join(d, "*.safetensors")))
-    if not files:
-        raise FileNotFoundError(f"no .safetensors in {d}")
-    base = os.path.basename(os.path.normpath(d)).lower()
-    for f in files:
-        if base and base in os.path.basename(f).lower():
-            return f
-    return files[0]
-
-
-def _quant_config(model_dir, keys):
-    """Return (kind, group_size) for the checkpoint's linear-layer format."""
-    qcfg = {}
-    p = os.path.join(model_dir, "quantization_config.json")
-    if os.path.isfile(p):
-        try:
-            qcfg = json.load(open(p, encoding="utf-8"))
-        except Exception:
-            qcfg = {}
-    packed = any(k.endswith(".packed_weight") for k in keys)
-    if packed:
-        return "w4", int(qcfg.get("group_size", 128))
-    return "w8", 0
-
-
-def load_weights(model_dir, device="cuda", log=print):
-    cfg = json.load(open(os.path.join(model_dir, "config.json"), encoding="utf-8"))
+def load_weights(model_dir, device="cuda", log=print, embed_bf16=False,
+                 head_w4=False):
+    cfg = json.load(open(os.path.join(model_dir, "config.json"),
+                         encoding="utf-8"))
     if "text_config" in cfg:
         cfg = cfg["text_config"]
     H = cfg["hidden_size"]
@@ -146,117 +137,252 @@ def load_weights(model_dir, device="cuda", log=print):
     NKV = cfg["num_key_value_heads"]
     HD = cfg["head_dim"]
     conv_dim = 2 * KD + VD
-    ckpt = _pick_ckpt(model_dir)
-    log(f"[qwen35] loading {ckpt}")
 
-    with safe_open(ckpt, framework="pt") as f:
-        keys = set(f.keys())
-        kind, wgroup = _quant_config(model_dir, keys)
-        dev = torch.device(device)
-        w = QwenWeights(cfg, quant=kind)
-        t = w.t
+    plan = read_quant_config(model_dir)
+    reader = CheckpointReader(model_dir)
+    keys = reader.keys()
+    # checkpoints from full-model repos nest the text weights under a prefix
+    prefix = "model.language_model." if any(
+        k.startswith("model.language_model.") for k in keys) else "model."
 
-        # ---- quantised linear layers: (role, out_dim, in_dim, n_layers) ------
-        roles = [
-            ("lin_qkv", conv_dim, H, n_lin),
-            ("lin_z", VD, H, n_lin),
-            ("lin_out", H, VD, n_lin),
-            ("attn_q", NQ * HD * 2, H, n_full),
-            ("attn_k", NKV * HD, H, n_full),
-            ("attn_v", NKV * HD, H, n_full),
-            ("attn_o", H, NQ * HD, n_full),
-            ("mlp_gate", I, H, NL),
-            ("mlp_up", I, H, NL),
-            ("mlp_down", H, I, NL),
-        ]
+    if plan["kind"] == "native":
+        packed = any(k.endswith(".packed_weight") for k in keys)
+        kind = "w4" if packed else "w8"
+        wgroup = int(plan["raw"].get("group_size", 128)) if packed else 0
+        src_set = {kind + "-custom"}
+    else:
+        kind = plan_engine_kind(plan)
         if kind == "w4":
-            for role, nout, nin, n in roles:
-                assert nin % wgroup == 0 and nin % 2 == 0, (role, nin, wgroup)
-                # K-major: [K//2, N] nibbles and [K//WG, N] scales, so the GEMM
-                # reads each tile as one coalesced run along N.
-                t[role] = _stacked((n, nin // 2, nout), torch.uint8, dev)
-                t[role + "_s"] = _stacked((n, nin // wgroup, nout), torch.bfloat16, dev)
+            if w4_native(plan):
+                wgroup = plan["group"]
+            else:
+                wgroup = 32      # requant target: finest native group
         else:
-            for role, nout, nin, n in roles:
-                t[role] = _stacked((n, nin, nout), torch.int8, dev)
-                t[role + "_s"] = _stacked((n, nout), torch.float32, dev)
+            wgroup = 0
+        src_set = set()
+    # asymmetric per-group zeros: only when the checkpoint's native asym grid
+    # is used directly (the requant path quantises symmetrically)
+    has_z = (kind == "w4"
+             and ((plan["kind"] == "awq" and w4_native(plan))
+                  or (plan["kind"] == "gptq" and not plan["sym"]
+                      and not plan["desc_act"] and w4_native(plan)))
+             and wgroup >= 32)
 
-        t["embed"] = _stacked((V, H), torch.bfloat16, dev)
-        t["final_norm"] = _stacked((H,), torch.bfloat16, dev)
-        t["in_norm"] = _stacked((NL, H), torch.bfloat16, dev)
-        t["post_norm"] = _stacked((NL, H), torch.bfloat16, dev)
-        t["lin_b"] = _stacked((n_lin, NH, H), torch.bfloat16, dev)
-        t["lin_a"] = _stacked((n_lin, NH, H), torch.bfloat16, dev)
-        t["lin_conv"] = _stacked((n_lin, conv_dim, cfg["linear_conv_kernel_dim"]),
-                                 torch.bfloat16, dev)
-        t["lin_dt"] = _stacked((n_lin, NH), torch.bfloat16, dev)
-        t["lin_alog"] = _stacked((n_lin, NH), torch.bfloat16, dev)
-        t["lin_norm_w"] = _stacked((n_lin, DV), torch.bfloat16, dev)
-        t["attn_qn"] = _stacked((n_full, HD), torch.bfloat16, dev)
-        t["attn_kn"] = _stacked((n_full, HD), torch.bfloat16, dev)
+    dev = torch.device(device)
+    w = QwenWeights(cfg, quant=kind)
+    w.has_z = has_z
+    t = w.t
 
-        def get(name):
-            return f.get_tensor(name)
+    # ---- quantised linear layers: (role, out_dim, in_dim, n_layers) ---------
+    roles = [
+        ("lin_qkv", conv_dim, H, n_lin),
+        ("lin_z", VD, H, n_lin),
+        ("lin_out", H, VD, n_lin),
+        ("attn_q", NQ * HD * 2, H, n_full),
+        ("attn_k", NKV * HD, H, n_full),
+        ("attn_v", NKV * HD, H, n_full),
+        ("attn_o", H, NQ * HD, n_full),
+        ("mlp_gate", I, H, NL),
+        ("mlp_up", I, H, NL),
+        ("mlp_down", H, I, NL),
+    ]
+    if kind == "w4":
+        for role, nout, nin, n in roles:
+            assert nin % wgroup == 0 and nin % 2 == 0, (role, nin, wgroup)
+            # K-major: [K//2, N] nibbles and [K//wg, N] scales, so the GEMM
+            # reads each tile as one coalesced run along N.
+            t[role] = _stacked((n, nin // 2, nout), torch.uint8, dev)
+            t[role + "_s"] = _stacked((n, nin // wgroup, nout), torch.bfloat16, dev)
+            if has_z:
+                t[role + "_z"] = _stacked((n, nin // wgroup, nout), torch.uint8, dev)
+    else:
+        for role, nout, nin, n in roles:
+            t[role] = _stacked((n, nin, nout), torch.int8, dev)
+            t[role + "_s"] = _stacked((n, nout), torch.float32, dev)
 
-        def put(role, slot, name):
-            """Copy one quantised projection into its stacked destination."""
+    t["final_norm"] = _stacked((H,), torch.bfloat16, dev)
+    t["in_norm"] = _stacked((NL, H), torch.bfloat16, dev)
+    t["post_norm"] = _stacked((NL, H), torch.bfloat16, dev)
+    t["lin_b"] = _stacked((n_lin, NH, H), torch.bfloat16, dev)
+    t["lin_a"] = _stacked((n_lin, NH, H), torch.bfloat16, dev)
+    t["lin_conv"] = _stacked((n_lin, conv_dim, cfg["linear_conv_kernel_dim"]),
+                             torch.bfloat16, dev)
+    t["lin_dt"] = _stacked((n_lin, NH), torch.bfloat16, dev)
+    t["lin_alog"] = _stacked((n_lin, NH), torch.bfloat16, dev)
+    t["lin_norm_w"] = _stacked((n_lin, DV), torch.bfloat16, dev)
+    t["attn_qn"] = _stacked((n_full, HD), torch.bfloat16, dev)
+    t["attn_kn"] = _stacked((n_full, HD), torch.bfloat16, dev)
+
+    # ---- per-projection emission ------------------------------------------
+    ext = plan["kind"] != "native"
+
+    def emit_w4(role, slot, conv):
+        """Engine W4 pieces -> stacked tensors for one projection."""
+        if conv["fmt"] == "nib":
+            t[role][slot].copy_(conv["nib_T"].to(dev, non_blocking=True))
+            t[role + "_s"][slot].copy_(
+                conv["scale_T"].to(torch.bfloat16).to(dev, non_blocking=True))
+        elif conv["fmt"] == "nibz":
+            t[role][slot].copy_(conv["nib_T"].to(dev, non_blocking=True))
+            t[role + "_s"][slot].copy_(
+                conv["scale_T"].to(torch.bfloat16).to(dev, non_blocking=True))
+            t[role + "_z"][slot].copy_(conv["zero_T"].to(dev, non_blocking=True))
+        elif conv["fmt"] == "w":
+            packed, sc = requant_w4_sym(conv["w"].float())
+            t[role][slot].copy_(packed.to(dev, non_blocking=True))
+            t[role + "_s"][slot].copy_(sc.to(dev, non_blocking=True))
+        else:  # dense bf16 [out, in]
+            packed, sc = requant_w4_sym(
+                conv["weight"].t().float().contiguous())
+            t[role][slot].copy_(packed.to(dev, non_blocking=True))
+            t[role + "_s"][slot].copy_(sc.to(dev, non_blocking=True))
+        src_set.add(conv.get("src", "?"))
+
+    def emit_w8(role, slot, conv):
+        if conv["fmt"] == "dense":
+            q, sc = requant_w8_row(conv["weight"].t().float().contiguous())
+        else:
+            q, sc = requant_w8_row(conv["w"].float())
+        t[role][slot].copy_(q.to(dev, non_blocking=True))
+        t[role + "_s"][slot].copy_(sc.to(dev, non_blocking=True))
+        src_set.add(conv.get("src", conv["fmt"]))
+
+    def put(role, slot, fq):
+        conv = convert_proj(reader, fq, plan) if ext else None
+        if conv is None:  # our own formats, stored natively
             if kind == "w4":
-                t[role][slot].copy_(get(name + ".packed_weight").t().contiguous().to(dev))
-                t[role + "_s"][slot].copy_(get(name + ".scale").t().contiguous().to(dev))
+                t[role][slot].copy_(
+                    reader.get(fq + ".packed_weight").t().contiguous()
+                    .to(dev, non_blocking=True))
+                t[role + "_s"][slot].copy_(
+                    reader.get(fq + ".scale").t().contiguous()
+                    .to(dev, non_blocking=True))
             else:
-                t[role][slot].copy_(get(name + ".qweight").to(dev))
-                t[role + "_s"][slot].copy_(get(name + ".scale").float().to(dev))
+                t[role][slot].copy_(reader.get(fq + ".qweight")
+                                    .to(dev, non_blocking=True))
+                t[role + "_s"][slot].copy_(reader.get(fq + ".scale").float()
+                                           .to(dev, non_blocking=True))
+        elif kind == "w4":
+            emit_w4(role, slot, conv)
+        else:
+            emit_w8(role, slot, conv)
 
-        lin_i = full_i = 0
-        for i in range(NL):
-            if layer_types[i] == "linear_attention":
-                p = f"model.layers.{i}.linear_attn."
-                put("lin_qkv", lin_i, p + "in_proj_qkv")
-                put("lin_z", lin_i, p + "in_proj_z")
-                put("lin_out", lin_i, p + "out_proj")
-                t["lin_b"][lin_i].copy_(get(p + "in_proj_b.weight").to(dev))
-                t["lin_a"][lin_i].copy_(get(p + "in_proj_a.weight").to(dev))
-                t["lin_conv"][lin_i].copy_(get(p + "conv1d.weight").squeeze(1).to(dev))
-                t["lin_dt"][lin_i].copy_(get(p + "dt_bias").to(dev))
-                t["lin_alog"][lin_i].copy_(get(p + "A_log").to(dev))
-                t["lin_norm_w"][lin_i].copy_(get(p + "norm.weight").to(dev))
-                lin_i += 1
-            else:
-                p = f"model.layers.{i}.self_attn."
-                put("attn_q", full_i, p + "q_proj")
-                put("attn_k", full_i, p + "k_proj")
-                put("attn_v", full_i, p + "v_proj")
-                put("attn_o", full_i, p + "o_proj")
-                t["attn_qn"][full_i].copy_(get(p + "q_norm.weight").to(dev))
-                t["attn_kn"][full_i].copy_(get(p + "k_norm.weight").to(dev))
-                full_i += 1
+    lin_i = full_i = 0
+    for i in range(NL):
+        if layer_types[i] == "linear_attention":
+            p = f"{prefix}layers.{i}.linear_attn."
+            put("lin_qkv", lin_i, p + "in_proj_qkv")
+            put("lin_z", lin_i, p + "in_proj_z")
+            put("lin_out", lin_i, p + "out_proj")
+            t["lin_b"][lin_i].copy_(reader.get(p + "in_proj_b.weight").to(dev))
+            t["lin_a"][lin_i].copy_(reader.get(p + "in_proj_a.weight").to(dev))
+            t["lin_conv"][lin_i].copy_(
+                reader.get(p + "conv1d.weight").squeeze(1).to(dev))
+            t["lin_dt"][lin_i].copy_(reader.get(p + "dt_bias").to(dev))
+            t["lin_alog"][lin_i].copy_(reader.get(p + "A_log").to(dev))
+            t["lin_norm_w"][lin_i].copy_(reader.get(p + "norm.weight").to(dev))
+            lin_i += 1
+        else:
+            p = f"{prefix}layers.{i}.self_attn."
+            put("attn_q", full_i, p + "q_proj")
+            put("attn_k", full_i, p + "k_proj")
+            put("attn_v", full_i, p + "v_proj")
+            put("attn_o", full_i, p + "o_proj")
+            t["attn_qn"][full_i].copy_(reader.get(p + "q_norm.weight").to(dev))
+            t["attn_kn"][full_i].copy_(reader.get(p + "k_norm.weight").to(dev))
+            full_i += 1
 
-            p = f"model.layers.{i}."
-            put("mlp_gate", i, p + "mlp.gate_proj")
-            put("mlp_up", i, p + "mlp.up_proj")
-            put("mlp_down", i, p + "mlp.down_proj")
-            t["in_norm"][i].copy_(get(p + "input_layernorm.weight").to(dev))
-            t["post_norm"][i].copy_(get(p + "post_attention_layernorm.weight").to(dev))
+        p = f"{prefix}layers.{i}."
+        put("mlp_gate", i, p + "mlp.gate_proj")
+        put("mlp_up", i, p + "mlp.up_proj")
+        put("mlp_down", i, p + "mlp.down_proj")
+        t["in_norm"][i].copy_(reader.get(p + "input_layernorm.weight").to(dev))
+        t["post_norm"][i].copy_(reader.get(
+            p + "post_attention_layernorm.weight").to(dev))
 
-        t["embed"].copy_(get("model.embed_tokens.weight").to(dev))
-        t["final_norm"].copy_(get("model.norm.weight").to(dev))
-
-        # lm_head: int8 with per-vocab-row scale, transposed to [H, V] for the GEMM
-        head = get("lm_head.weight") if "lm_head.weight" in keys else get("model.embed_tokens.weight")
-        head_q = _stacked((H, V), torch.int8, dev)
-        head_s = _stacked((V,), torch.float32, dev)
-        step = 16384
+    # ---- embedding table + lm_head -----------------------------------------
+    # Both formats tie the head to `embed_tokens.weight`, but the two consumers
+    # need different layouts: the gather wants [V, H] and the logits GEMM wants
+    # [H, V]. Two tensors: embed int8 with one scale per vocabulary row, head
+    # int8 (or optional W4) with per-row scales.
+    src = reader.get(prefix + "embed_tokens.weight")
+    if embed_bf16:
+        t["embed"] = _stacked((V, H), torch.bfloat16, dev)
+        t["embed"].copy_(src.to(dev, non_blocking=False))
+    else:
+        t["embed"] = _stacked((V, H), torch.int8, dev)
+        t["embed_s"] = _stacked((V,), torch.bfloat16, dev)
+        step = 8192
         for s0 in range(0, V, step):
             s1 = min(V, s0 + step)
-            blk = head[s0:s1].to(dev, non_blocking=False).float()
+            blk = src[s0:s1].to(dev, non_blocking=False).float()
             amax = blk.abs().amax(dim=1).clamp_min(1e-8)
             sc = amax / 127.0
-            qb = torch.clamp(torch.round(blk / sc[:, None]), -127, 127).to(torch.int8)
-            head_q[:, s0:s1].copy_(qb.T.contiguous())
+            t["embed"][s0:s1].copy_(
+                torch.clamp(torch.round(blk / sc[:, None]), -127, 127)
+                .to(torch.int8))
+            t["embed_s"][s0:s1].copy_(sc.to(torch.bfloat16))
+            del blk
+
+    head_name = "lm_head.weight" if reader.has("lm_head.weight") else None
+    head_src = reader.get(head_name) if head_name else src
+    if head_w4:
+        # W4, K-major nibbles so `gemm_i8` dispatches to `gemm_w4`.
+        # NOT the default: the 4-bit grid measurably regresses teacher-forced
+        # top-1 (see README).
+        head_q = _stacked((H // 2, V), torch.uint8, dev)
+        head_s = _stacked((H // 64, V), torch.bfloat16, dev)  # per-64 group
+        step = 8192
+        for s0 in range(0, V, step):
+            s1 = min(V, s0 + step)
+            blk = head_src[s0:s1].to(dev, non_blocking=False).float()
+            n, _ = blk.shape
+            b3 = blk.view(n, H // 64, 64)
+            amax = b3.abs().amax(dim=2).clamp_min(1e-8)
+            sc = amax / 7.0                            # symmetric [-8, 7] int4
+            q = torch.clamp(torch.round(b3 / sc[:, :, None]), -8, 7) + 8
+            lo = q[:, :, 0::2].to(torch.uint8)         # even K in the low nibble
+            hi = q[:, :, 1::2].to(torch.uint8)         # odd K in the high nibble
+            head_q[:, s0:s1].copy_(
+                (lo.to(torch.int32) | (hi.to(torch.int32) << 4))
+                .to(torch.uint8).reshape(n, H // 2).t().contiguous())
+            head_s[:, s0:s1].copy_(sc.t().contiguous())
+            del blk, q, lo, hi
+        t["lm_head"] = head_q
+        t["lm_head_s"] = head_s
+    else:
+        # int8 [H, V] with one scale per vocab row
+        head_q = _stacked((H, V), torch.int8, dev)
+        head_s = _stacked((V,), torch.float32, dev)
+        step = 8192
+        for s0 in range(0, V, step):
+            s1 = min(V, s0 + step)
+            blk = head_src[s0:s1].to(dev, non_blocking=False).float()
+            amax = blk.abs().amax(dim=1).clamp_min(1e-8)
+            sc = amax / 127.0
+            head_q[:, s0:s1].copy_(
+                torch.clamp(torch.round(blk / sc[:, None]), -127, 127)
+                .to(torch.int8).t().contiguous())
             head_s[s0:s1].copy_(sc)
-            del blk, qb
+            del blk
         t["lm_head"] = head_q
         t["lm_head_s"] = head_s
 
-    log(f"[qwen35] weights loaded: {w.nbytes()/1e9:.2f} GB ({kind.upper()}) on {device}")
+    t["final_norm"].copy_(reader.get(prefix + "norm.weight").to(dev))
+
+    dense_n = sum(1 for s in src_set if s.startswith("dense"))
+    req = sorted(s for s in src_set if "requant" in s)
+    log(f"[qwen35] weights loaded: {w.nbytes()/1e9:.2f} GB "
+        f"({','.join(sorted(x for x in src_set
+                           if not x.startswith('dense')))}"
+        f", embed {'bf16' if embed_bf16 else 'int8'}, "
+        f"head {'W4' if head_w4 else 'int8'}, "
+        f"zeros {'on' if has_z else 'off'}) on {device}")
+    if req:
+        log(f"[qwen35] note: requantised from native grid: {req[0]}"
+            + (f" (+{len(req)-1} projections)" if len(req) > 1 else ""))
+    if dense_n:
+        log(f"[qwen35] note: {dense_n} non-quantised projection"
+            f"{'s' if dense_n != 1 else ''} from the checkpoint (ignore list), "
+            f"quantised to int8/int4 at load")
     return w
