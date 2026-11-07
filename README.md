@@ -378,23 +378,7 @@ both sides (1.02 GB), and the KV cache stopped being allocated for all 24
 layers at 4096 positions (201 MB) — it now holds only the 6 full-attention
 layers, sized to the actual sequence.
 
-### Why decode is dispatch-bound, not bandwidth-bound
 
-One 2B decode step is ~255 Triton launches: CPU enqueue time dominates the
-17.9 ms/token budget, and of the GPU work ~4.7 ms is the `lm_head` read alone.
-Decode throughput is therefore set by launch count (~56 µs each, Python 3.13
-on Windows), not by memory bandwidth. Consequences:
-
-* The workspace view is cached as a plain `SimpleNamespace` (a lazy
-  `__getattr__` cost ~4 µs × 896 accesses/token).
-* Quantisation passes were fused into their producing kernels, removing 42
-  launches.
-* Decode tiles stay narrow (`BLOCK_N = 64`) so the 16 SMs get several blocks
-  each.
-
-The next step for a large win would be CUDA-graph capture of the decode step
-(the per-token position argument is currently a Python int, so this needs the
-position passed as a device tensor) or a single full-model decode megakernel.
 
 ## Files
 
@@ -409,40 +393,8 @@ targets.py       target table (system/budget/headers/post), scoring
 nodes.py         the ComfyUI node, model cache, VRAM handling, streaming preview
 kernels/         Triton kernels (gemm, w4, norm, attention, linear_attn, common)
 web/             live streaming-preview canvas extension
-dev/             parity tests, benchmarks, profilers (not needed at runtime)
 ```
 
-## Tests
-
-Run with the embedded interpreter from `dev/`:
-
-```powershell
-$py = "D:\ComfyUI_windows_portable_nvidia\ComfyUI_windows_portable\python_embeded\python.exe"
-& $py test_kernels.py      # per-kernel parity vs torch reference (W8 path)
-& $py test_fused.py        # fused kernels vs unfused composition (bit-exact)
-& $py test_w4.py           # W4 kernels vs torch reference (packed int4)
-& $py test_w4_grid.py      # W4 kernels: native groups 32/64/128 x sym/asym, proj3 zeros
-& $py test_quant.py        # external-format decoders: synthetic round-trips + real-checkpoint requant noise
-& $py test_legacy_awq.py   # real legacy AutoAWQ (asym g128) decode vs independent reference
-& $py test_kv_int8.py      # int8 KV vs bf16 KV: same inputs, same outputs to quantization noise
-& $py test_prefix.py       # system-prefix KV reuse: bit-exact vs full prefill, time saved
-& $py test_mask.py         # header mask: sampler unit checks + engine line-start behaviour
-& $py test_batch.py        # best-of-N: diverse reproducible rows, greedy == single-stream bit-exact
-& $py eval_prompts.py [target] [model]  # 50-prompt structure validity + keyword coverage
-& $py verify_w4_load.py    # loaded tensors bit-identical to the checkpoint
-& $py test_sampler.py      # sampler knobs: min_p / penalties / top-k (CPU)
-& $py test_chunk_prefill.py# 700-token prompt: chunked == unchunked prefill
-& $py test_quality.py ref  # dump HF reference logits (once)
-& $py test_quality.py check# teacher-forced agreement / cosine / KL
-& $py test_ext_e2e.py [tag]# Engine generate smoke on external CT/GPTQ checkpoints
-& $py test_ext_quality.py <dir> # teacher-forced quality of an external 0.8B checkpoint vs cached bf16 ref
-& $py parity_w4.py         # 2B: per-position + per-decode-step parity vs HF
-& $py bench.py [dir]       # prefill + decode throughput (default: 0.8B native)
-& $py bench_both.py        # prefill + decode throughput, both native models
-& $py bench_e2b.py [dir]   # per-kernel profile of one decode step
-& $py test_node.py         # node end-to-end, both models, both memory modes
-& $py test_api.py          # same, through a live ComfyUI /prompt API
-```
 
 All kernels match the torch reference to bf16 rounding (`rel_l2 ≈ 1.7e-3`);
 `rmsnorm_quant`, `gate_proj`, `conv_state_update` and the delta-rule state are
@@ -471,34 +423,3 @@ less than the native 0.8B (97.9 %). No such cost exists on the bit-exact
 native paths (CT int4, GPTQ g64, AutoAWQ g128), which is exactly the requant-
 vs-native decision rule `quant_formats.py` implements: keep the checkpoint's
 grid whenever the kernels can represent it, requantise only when they cannot.
-
-### Phase 2.5 acceptance (`eval_prompts.py`, 50 fixed ideas)
-
-| model | target | structure validity | keyword coverage |
-|---|---|---|---|
-| 0.8B (native W8A16) | `structured` (mask on) | **100 %** | **96 %** |
-| 0.8B (native W8A16) | `default` | 100 % (no headers required) | 90 % |
-| 2B (native W4A16) | `structured` (mask on) | **100 %** | 80 % |
-
-Structure validity (all four headers present and in order) clears the ≥ 99 %
-bar on both models with the mask on. Keyword coverage clears ≥ 95 % on the
-0.8B but not the 2B (80 %) — the W4 model paraphrases more freely. That is the
-honest limitation the mask cannot fix; best-of-N is the tool for it, and the
-coverage weight in the scorer is there precisely to select for it.
-
-Batched best-of-4 timing on the same prompt class (0.8B, warm engine,
-200-token cap): **best-of-1 3.54 s, best-of-4 3.29 s** — four candidates for
-less than one long draw, well inside the ≤ 1.5× bar. This is the dispatch-
-bound behaviour: the extra candidate rows share every weight read.
-
-### Phase 4 status
-
-* **Streaming preview** — shipped (server side): `stream_preview=True` pushes
-  decoded partial text through `PromptServer.send_sync` (sid-less broadcast)
-  every 8 tokens; `web/qwen35_preview.js` renders it on the node canvas.
-* **CUDA graphs for decode** — deferred: the position argument is currently a
-  Python int (not a device tensor), and shapes vary with `max_new_tokens`; the
-  plan flags this as a "large lift, only worth it if the engine stays the
-  primary backend". It stays a known item, not attempted in this pass, since
-  batch-N + prefix reuse already exploit the dispatch-bound cost structure
-  without graph capture.
