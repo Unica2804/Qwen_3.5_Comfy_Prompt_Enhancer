@@ -21,6 +21,7 @@ The embedding table is always quantised at load time (int8, per-vocab-row
 scale; W4 head optional via `head_w4=True`, default off) regardless of format.
 """
 import glob
+import hashlib
 import json
 import os
 
@@ -29,6 +30,90 @@ import torch
 from .quant_formats import (CheckpointReader, convert_proj, plan_engine_kind,
                             read_quant_config, requant_w4_sym, requant_w8_row,
                             w4_native)
+
+
+# --------------------------------------------------------------------------
+# pack cache: the AWQ/GPTQ/CT decode + requantize at load time is
+# deterministic for a given checkpoint and converter version, so the stacked
+# tensors are dumped once and memory-mapped afterwards.  The key covers the
+# checkpoint files, the converter code and the embedding options, so edits to
+# the converters or swapping checkpoints force a reconvert.
+# --------------------------------------------------------------------------
+
+_PACK_FORMAT = 1
+
+
+def _pack_root():
+    override = os.environ.get("QWEN35_WEIGHTS_CACHE")
+    root = override or (
+        os.path.join(os.environ.get("LOCALAPPDATA",
+                                    os.path.join(os.path.expanduser("~"),
+                                                 "AppData", "Local")),
+                     "qwen35_prompt_enhancer", "weights_cache")
+        if os.name == "nt" else
+        os.path.join(os.path.expanduser("~"), ".cache",
+                     "qwen35_prompt_enhancer", "weights_cache"))
+    try:
+        os.makedirs(root, exist_ok=True)
+        probe = os.path.join(root, ".probe")
+        with open(probe, "wb") as f:
+            f.write(b"ok")
+        os.remove(probe)
+    except OSError:
+        return None
+    return root
+
+
+def _pack_key(model_dir, embed_bf16, head_w4):
+    sig = []
+    for pattern in ("*.safetensors", "*.index.json"):
+        for f in sorted(glob.glob(os.path.join(model_dir, pattern))):
+            try:
+                st = os.stat(f)
+                sig.append((os.path.relpath(f, model_dir), st.st_size,
+                            st.st_mtime_ns))
+            except OSError:
+                return None
+    try:
+        st = os.stat(os.path.join(model_dir, "config.json"))
+        sig.append(("config.json", st.st_size, st.st_mtime_ns))
+    except OSError:
+        return None
+    # converter version: touching these files forces a reconvert
+    for extra in ("weights.py", "quant_formats.py"):
+        try:
+            st = os.stat(os.path.join(os.path.dirname(__file__), extra))
+            sig.append((extra, st.st_size, st.st_mtime_ns))
+        except OSError:
+            return None
+    sig.append(("options", bool(embed_bf16), bool(head_w4), _PACK_FORMAT))
+    blob = json.dumps(sig, sort_keys=True).encode()
+    return hashlib.sha1(blob).hexdigest()
+
+
+def _save_pack(w, pack):
+    tmp = f"{pack}.tmp-{os.getpid()}"
+    state = {
+        "format": _PACK_FORMAT,
+        "quant": w.quant,
+        "has_z": w.has_z,
+        "cfg": w.cfg,
+        "tensors": {k: v.detach().cpu().contiguous() for k, v in w.t.items()},
+    }
+    torch.save(state, tmp)
+    os.replace(tmp, pack)
+
+
+def _load_pack(pack, log):
+    state = torch.load(pack, map_location="cpu", weights_only=False)
+    if state.get("format") != _PACK_FORMAT:
+        log("[qwen35] pack cache: format mismatch; reconverting")
+        return None
+    w = QwenWeights(state["cfg"], quant=state.get("quant", "w8"))
+    w.has_z = bool(state.get("has_z", False))
+    w.t = {k: v.contiguous() for k, v in state["tensors"].items()}
+    w.device = torch.device("cpu")
+    return w
 
 
 class QwenWeights:
@@ -47,16 +132,20 @@ class QwenWeights:
         return self.t[k]
 
     def to(self, device):
-        if device == self.device:
+        if self.device == torch.device(device):
             return self
         for k, v in self.t.items():
             self.t[k] = v.to(device, non_blocking=False)
-        self.device = device
+        # reload path should leave storage on plain CUDA or plain CPU tensors
+        # again — dropping pinning keeps the allocator from tracking it as
+        # "still pinned" when the same object is re-used for the next switch
+        self.device = torch.device(device)
         return self
 
     def offload(self):
         """Move every weight tensor to pinned CPU memory, freeing VRAM."""
-        if self.device.type == "cpu":
+        if self.device.type == "cpu" and all(v.device.type == "cpu"
+                                             for v in self.t.values()):
             return
         for k, v in self.t.items():
             try:
@@ -117,6 +206,25 @@ def discover_models(roots):
 
 def load_weights(model_dir, device="cuda", log=print, embed_bf16=False,
                  head_w4=False):
+    target = torch.device(device)
+    use_pack = os.environ.get("QWEN35_DISABLE_PACK") != "1"
+    root = key = pack = None
+    if use_pack:
+        root = _pack_root()
+        key = _pack_key(model_dir, embed_bf16, head_w4)
+        pack = os.path.join(root, f"{key}.pt") if (root and key) else None
+        if pack and os.path.exists(pack):
+            try:
+                w = _load_pack(pack, log)
+                if w is not None:
+                    w.to(target)
+                    log("[qwen35] engine weights loaded from pack cache")
+                    return w
+            except Exception as e:
+                log(f"[qwen35] pack cache unreadable ({e}); reconverting")
+    # build on the target device; the pack dump keeps CPU copies, so cached
+    # and fresh loads hold the same bits
+    build_dev = target
     cfg = json.load(open(os.path.join(model_dir, "config.json"),
                          encoding="utf-8"))
     if "text_config" in cfg:
@@ -168,7 +276,7 @@ def load_weights(model_dir, device="cuda", log=print, embed_bf16=False,
                       and not plan["desc_act"] and w4_native(plan)))
              and wgroup >= 32)
 
-    dev = torch.device(device)
+    dev = build_dev
     w = QwenWeights(cfg, quant=kind)
     w.has_z = has_z
     t = w.t
@@ -378,6 +486,15 @@ def load_weights(model_dir, device="cuda", log=print, embed_bf16=False,
         f", embed {'bf16' if embed_bf16 else 'int8'}, "
         f"head {'W4' if head_w4 else 'int8'}, "
         f"zeros {'on' if has_z else 'off'}) on {device}")
+    if pack is not None:
+        try:
+            _save_pack(w, pack)
+            log(f"[qwen35] cached packed weights to {pack}")
+        except Exception as e:
+            log(f"[qwen35] pack cache write failed (continuing): {e}")
+    if w.device != target:
+        w.to(target)
+    w.device = target
     if req:
         log(f"[qwen35] note: requantised from native grid: {req[0]}"
             + (f" (+{len(req)-1} projections)" if len(req) > 1 else ""))

@@ -187,6 +187,7 @@ class Engine:
 
     def offload(self):
         self.w.offload()
+        self._prefix_snap = None       # prefix KV goes on CPU; keep it inline for reload
         self.dstate = self.dstate.to("cpu")
         self.cstate = self.cstate.to("cpu")
         self.kv = self.kv.to("cpu")
@@ -197,6 +198,10 @@ class Engine:
 
     def reload(self):
         self.w.to(self.device)
+        self._prefix_snap = None       # offload+reload discards the prefix snapshot now — it
+                                      # used to point at pre-offload tensors; the authoritative
+                                      # refresh re-prefills the prefix on the next call anyway
+        self.pos = 0
         d = self.device
         self.kv = self.kv.to(d)
         if self.kvs is not None:
@@ -474,8 +479,15 @@ class Engine:
                 block_n=512, block_k=64)
         return out
 
-    def forward(self, token_ids, pos0=0):
-        """Run `token_ids` (list[int]) starting at absolute position `pos0`; returns logits."""
+    def forward(self, token_ids, pos0=0, image_embds=None, image_span=None):
+        """Run `token_ids` (list[int]) starting at absolute position `pos0`; returns logits.
+
+        With `image_embds` [S, hidden] (device tensor) and `image_span=(s, e)`
+        (absolute token positions), rows `s..e` of the embedding output are
+        overwritten with the vision embeddings — matching HF's
+        `hidden_states[image_mask] = image_embeds`.  Rows are overwritten
+        before layer 0, so the rest of the pipeline is untouched.
+        """
         T = len(token_ids)
         ids = torch.tensor(token_ids, dtype=torch.long, device=self.device)
         ws = self.ws.view(T)
@@ -487,6 +499,25 @@ class Engine:
             torch.mul(ws.eq[:T], sc, out=ws.hidden)
         else:
             torch.index_select(emb, 0, ids, out=ws.hidden)
+        if image_embds is not None and image_span is not None:
+            # `image_span` may be a single (s, e) or a list of them (one per
+            # image in the batch); `image_embds` rows are concatenated in the
+            # same order.
+            if isinstance(image_span, (list, tuple)) and image_span \
+                    and isinstance(image_span[0], (list, tuple)):
+                spans = image_span
+            else:
+                spans = [image_span]
+            a, b = int(pos0), int(pos0) + T
+            off = 0
+            for span in spans:
+                s, e = int(span[0]), int(span[1])
+                k0 = off
+                off += e - s
+                lo, hi = max(s, a), min(e, b)
+                if lo < hi:
+                    ws.hidden[lo - a: hi - a].copy_(
+                        image_embds[k0 + lo - s: k0 + hi - s].to(ws.hidden.dtype))
         lin_i = full_i = 0
         self.debug = [] if self._collect else None
         for i in range(self.NL):
@@ -503,18 +534,21 @@ class Engine:
         return self._final_logits(T)
 
     # ------------------------------------------------------------ generation
-    def _forward_chunks(self, token_ids, pos0):
+    def _forward_chunks(self, token_ids, pos0, image_embds=None, image_span=None):
         """Run ids (chunked) starting at absolute position `pos0`; current logits."""
         logits = None
         for c0 in range(0, len(token_ids), self.prefill_chunk):
             logits = self.forward(token_ids[c0: c0 + self.prefill_chunk],
-                                  pos0=pos0 + c0)
+                                  pos0=pos0 + c0,
+                                  image_embds=image_embds,
+                                  image_span=image_span)
         return logits
 
-    def prefill(self, token_ids):
+    def prefill(self, token_ids, image_embds=None, image_span=None):
         """Run the prompt (chunked) and return the logits for the next token."""
         self.reset()
-        return self._forward_chunks(token_ids, 0)
+        return self._forward_chunks(token_ids, 0, image_embds=image_embds,
+                                    image_span=image_span)
 
     # ---- system-prefix KV reuse (2.1) -------------------------------------
     # The system prompt is identical on every call; after the first prefill we
@@ -570,7 +604,8 @@ class Engine:
     def generate(self, prompt_ids, max_new_tokens=256, temperature=0.0, top_k=0, top_p=1.0,
                  seed=None, stop_ids=(248046, 248044), on_token=None,
                  min_p=0.0, repetition_penalty=1.0, presence_penalty=0.0,
-                 prefix_len=0, header_mask=None, newline_id=None, line_grammar=None):
+                 prefix_len=0, header_mask=None, newline_id=None, line_grammar=None,
+                 image_embds=None, image_span=None):
         """Sample `max_new_tokens` for one prompt; returns (token_ids, warnings).
 
         The engine holds a generation lock for the whole call: pos/kv/dstate/
@@ -587,8 +622,15 @@ class Engine:
 
         With `line_grammar` set (a SectionGrammar), the whole header is
         constrained token by token (2.3 v2): supersedes `header_mask`.
+
+        With `image_embds`/`image_span` (see `forward`), the image rows of the
+        prompt are embedded from the vision tower instead of the token table.
+        An image forces `prefix_len = 0`: the system prefix snapshot is a pure
+        text optimisation and the image turn always sits in `rest`.
         """
         from .sampler import sample_logits
+        if image_embds is not None:
+            prefix_len = 0
         with self._gen_lock:
             budget = self.ctx_cap - 1
             warnings = []
@@ -618,14 +660,21 @@ class Engine:
                 snap = self._prefix_snap
                 if snap is not None and snap[0] == prefix:
                     self._restore(snap[1])
-                    logits = self._forward_chunks(rest, self.pos)
+                    logits = self._forward_chunks(rest, self.pos,
+                                                  image_embds=image_embds,
+                                                  image_span=image_span)
                 else:
                     self.reset()
-                    self._forward_chunks(prompt_ids[:prefix_len], 0)
+                    self._forward_chunks(prompt_ids[:prefix_len], 0,
+                                         image_embds=image_embds,
+                                         image_span=image_span)
                     self._prefix_snap = (prefix, self._snap())
-                    logits = self._forward_chunks(rest, self.pos)
+                    logits = self._forward_chunks(rest, self.pos,
+                                                  image_embds=image_embds,
+                                                  image_span=image_span)
             else:
-                logits = self.prefill(prompt_ids)
+                logits = self.prefill(prompt_ids, image_embds=image_embds,
+                                      image_span=image_span)
             out = []
             line_start = True          # the first generated token starts a line
             gs = line_grammar.start_state() if line_grammar is not None else None

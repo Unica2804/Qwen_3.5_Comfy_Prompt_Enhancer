@@ -7,6 +7,11 @@ the node; the engine itself stays neutral).
 
 Warp order: penalties on the raw logits -> temperature -> top-k -> min-p ->
 top-p -> softmax draw.
+
+With `top_k > 0` the whole warp runs on the k kept logits (the mass is entirely
+on them, and top-k is pre-sorted, so top-p needs no full-vocab sort). The kept
+probabilities are bit-identical to the old full-vocab path; only the RNG draw
+sequence for a fixed seed differs — distributions are unchanged.
 """
 import torch
 
@@ -46,8 +51,20 @@ def sample_logits(logits, temperature=0.0, top_k=0, top_p=1.0, generator=None,
     x = x / float(temperature)
     if top_k and top_k > 0:
         k = min(int(top_k), x.numel())
-        kth = torch.topk(x, k).values[-1]
-        x = torch.where(x < kth, torch.full_like(x, float("-inf")), x)
+        vals, idx = torch.topk(x, k)             # sorted desc, already the full mass
+        # softmax over the top-k is identical to the full softmax (tail is 0);
+        # top-k are pre-sorted, so top_p needs no second sort
+        probs = torch.softmax(vals, dim=-1)
+        if min_p is not None and min_p > 0.0:
+            keep = probs >= float(min_p) * probs.max()
+            probs = torch.where(keep, probs, torch.zeros_like(probs))
+        if top_p is not None and 0.0 < top_p < 1.0:
+            cs = torch.cumsum(probs, dim=-1)
+            drop = (cs - probs) > top_p
+            probs = torch.where(drop, torch.zeros_like(probs), probs)
+        if not (probs.sum() > 0):                # includes NaN (all -inf top-k)
+            return int(torch.argmax(x))
+        return int(idx[int(torch.multinomial(probs, 1, generator=generator))])
     probs = torch.softmax(x, dim=-1)
     if min_p is not None and min_p > 0.0:
         keep = probs >= float(min_p) * probs.max()

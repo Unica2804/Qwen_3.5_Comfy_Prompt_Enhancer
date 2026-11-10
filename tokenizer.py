@@ -46,6 +46,51 @@ class ChatTokenizer:
             enable_thinking=enable_thinking,
         )
 
+    def render_prompt_mm(self, system_prompt, user_text, n_images,
+                         enable_thinking=False):
+        """Render the chat template with `n_images` image placeholders leading
+        the user turn. The template expands each to
+        `<|vision_start|><|image_pad|><|vision_end|>`; the single `<|image_pad|>`
+        marker per image must be expanded to the grid-derived count by the
+        caller (same contract as the HF processor)."""
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        content = [{"type": "image"} for _ in range(n_images)]
+        content.append({"type": "text", "text": user_text})
+        messages.append({"role": "user", "content": content})
+        return self.template.render(
+            messages=messages,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+
+    @staticmethod
+    def expand_image_pads(text, pad_counts):
+        """Replace the n-th single `<|image_pad|>` marker in `text` with
+        `pad_counts[n]` copies of it, in order."""
+        for count in pad_counts:
+            text = text.replace("<|image_pad|>", "<|image_pad|>" * int(count), 1)
+        return text
+
+    def encode_chat_mm(self, system_prompt, user_text, pad_counts,
+                       enable_thinking=False):
+        """Render + expand image markers and tokenize. Returns (ids, spans)
+        where spans is a list of (start, end) absolute token positions of the
+        `<|image_pad|>` runs, one per image, in order."""
+        text = self.render_prompt_mm(system_prompt, user_text, len(pad_counts),
+                                     enable_thinking=enable_thinking)
+        text = self.expand_image_pads(text, pad_counts)
+        ids = self.tok.encode(text).ids
+        pad_id = self.tok.token_to_id("<|image_pad|>")
+        spans = []
+        pos = 0
+        for count in pad_counts:
+            start = ids.index(pad_id, pos)
+            spans.append((start, start + int(count)))
+            pos = start + int(count)
+        return ids, spans
+
     def encode_chat(self, system_prompt, user_text, enable_thinking=False):
         text = self.render_prompt(system_prompt, user_text, enable_thinking)
         return self.tok.encode(text).ids

@@ -15,7 +15,8 @@ except Exception:  # running outside ComfyUI (tests)
 
 from .engine import Engine
 from .targets import (SectionGrammar, TARGETS, build_header_mask, get_target,
-                      keywords_of, postprocess, score_candidates)
+                      postprocess,
+                      preserved_keywords, score_candidates)
 from .tokenizer import DEFAULT_SYSTEM, ChatTokenizer
 from .weights import discover_models
 
@@ -275,7 +276,8 @@ class Qwen35PromptEnhancer:
                 "memory_mode": (["offload_after_run", "keep_loaded"], {
                     "default": "offload_after_run",
                     "tooltip": "offload_after_run frees VRAM after every run; "
-                               "keep_loaded keeps the engine resident for faster repeats.",
+                               "keep_loaded keeps the engine (and, for images, "
+                               "the vision tower) resident for faster repeats.",
                 }),
                 "max_tokens": (MAX_TOKEN_CHOICES, {
                     "default": "1024",
@@ -331,6 +333,11 @@ class Qwen35PromptEnhancer:
                     "tooltip": "Push decoded partial text live to the browser "
                                "while generating (needs the web/ extension).",
                 }),
+                "image": ("IMAGE", {
+                    "tooltip": "Optional reference image(s). The encoder grounds the "
+                               "expanded prompt in the image instead of pure text "
+                               "(multiple images in the batch are all encoded).",
+                }),
             },
         }
 
@@ -343,10 +350,16 @@ class Qwen35PromptEnhancer:
     def enhance(self, text, model, memory_mode, max_tokens, system_prompt,
                 temperature=0.7, top_p=0.9, top_k=40, min_p=0.05,
                 repetition_penalty=1.05, presence_penalty=0.0, seed=0,
-                target="default", best_of=1, stream_preview=False):
+                target="default", best_of=1, stream_preview=False,
+                image=None):
         text = (text or "").strip()
+        text_was_default = False
         if not text:
-            return {"ui": {"text": [""]}, "result": ("", 0, "")}
+            if image is not None:
+                text = "Describe this image in detail."
+                text_was_default = True
+            else:
+                return {"ui": {"text": [""]}, "result": ("", 0, "")}
 
         tgt = get_target(target)
         model_dir = _resolve_model(model)
@@ -357,103 +370,190 @@ class Qwen35PromptEnhancer:
         eng = _get_engine(model_dir)
         tok = _get_tokenizer(model_dir)
 
-        # System priority: explicit user text wins; else the target's own
-        # system if one is defined and the field is untouched/empty; else the
-        # node default.  (`tgt["system"]` is None for "default".)
-        system = (system_prompt or "")
-        if tgt.get("system") and system in ("", DEFAULT_SYSTEM):
-            system = tgt["system"]
-        if not system:
-            system = DEFAULT_SYSTEM
-
-        ids = tok.encode_chat(system, text)
-        prefix_len = tok.encode_chat_prefix_len(system, ids)
-        stop = tok.stop_ids
-        mask = build_header_mask(tok, tgt.get("headers") or [], stop,
-                                 eng.V, eng.device)
-        newline_id = tok.token_to_id("\n")
-        headers = tgt.get("headers") or []
-        grammar = None
-        if headers:
-            grammar = SectionGrammar(headers, tok, eng.V, eng.device, stop,
-                                     newline_id)
-            if not grammar.uniform:
-                # non-uniform tokenised lengths: keep the v1 header mask
-                grammar = None
-                _log("[qwen35] headers tokenise to non-uniform lengths; "
-                     "using the v1 header mask for this target")
-
-        pbar = comfy.utils.ProgressBar(limit) if comfy is not None else None
-        stream = stream_preview and comfy is not None
-        state = {"n": 0, "ids": []}
-
-        def on_token(tok_id):
-            state["n"] += 1
-            if pbar is not None:
-                pbar.update(1)
-            if stream:
-                state["ids"].append(tok_id)
-                if state["n"] % 8 == 0:
-                    _stream_preview(tok, state["ids"][-256:])
-
-        gen_kw = dict(
-            max_new_tokens=limit,
-            temperature=float(temperature),
-            top_k=int(top_k),
-            top_p=float(top_p),
-            seed=int(seed),
-            stop_ids=stop,
-            min_p=float(min_p),
-            repetition_penalty=float(repetition_penalty),
-            presence_penalty=float(presence_penalty),
-            prefix_len=prefix_len,
-            header_mask=mask,
-            newline_id=newline_id,
-            line_grammar=grammar,
-        )
         try:
-            with torch.inference_mode():
+            # System priority: explicit user text wins; else the target's own
+            # system if one is defined and the field is untouched/empty; else the
+            # node default.  (`tgt["system"]` is None for "default".)
+            system = (system_prompt or "")
+            if tgt.get("system") and system in ("", DEFAULT_SYSTEM):
+                system = tgt["system"]
+            if not system:
+                system = DEFAULT_SYSTEM
+
+            # Layer A: the preserve list is appended to the user turn (not the
+            # system prompt, so the prefix KV reuse still fires); only the user
+            # turn is re-prefilled anyway, so the hit is free (Phase 5).
+            # when the user left text empty and the image branch supplied the
+            # default question, don't "preserve" words from a sentence the user
+            # never wrote
+            preserved = [] if text_was_default else preserved_keywords(text)
+
+            image_payload = None
+            if image is not None:
+                import numpy as np
+                from PIL import Image
+                from .vision import load_vision, offload_vision, vision_tower_size
+                from .vision_pre import preprocess_images
+
+                imgs = []
+                for b in range(int(image.shape[0])):
+                    arr = (image[b].clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
+                    imgs.append(Image.fromarray(arr))
+                pv, grid_thw = preprocess_images(imgs, device="cpu")
+                pad_counts = [int(t * h * w) // 4
+                              for t, h, w in grid_thw.tolist()]
+                ids, spans = tok.encode_chat_mm(system, text, pad_counts)
+                prefix_len = 0
+                if mm is not None:
+                    try:
+                        _request_vram(vision_tower_size(model_dir)
+                                      + 256 * 1024 ** 2, torch.device("cuda"))
+                    except Exception as e:
+                        _log(f"[qwen35] vision VRAM request skipped: {e}")
+                tower = load_vision(model_dir, device="cuda", dtype=torch.bfloat16)
+                try:
+                    with torch.no_grad():
+                        embeds = tower(pv.to("cuda", torch.bfloat16),
+                                       grid_thw=grid_thw.to("cuda"))
+                finally:
+                    if memory_mode != "keep_loaded":
+                        # VRAM is reserved for the text decode that follows
+                        offload_vision()
+                    # keep_loaded: stay resident; load_vision returns the
+                    # cached tower on the next image run
+                image_payload = {"image_embds": embeds, "image_span": spans}
+                _log(f"[qwen35] encoded {len(imgs)} image(s); "
+                     f"{embeds.shape[0]} image tokens "
+                     f"(spans: {spans})")
+            else:
+                ids = tok.encode_chat(system, text)
+                prefix_len = tok.encode_chat_prefix_len(system, ids)
+            stop = tok.stop_ids
+            mask = build_header_mask(tok, tgt.get("headers") or [], stop,
+                                     eng.V, eng.device)
+            newline_id = tok.token_to_id("\n")
+            headers = tgt.get("headers") or []
+            grammar = None
+            if headers:
+                grammar = SectionGrammar(headers, tok, eng.V, eng.device, stop,
+                                         newline_id)
+                if not grammar.uniform:
+                    # non-uniform tokenised lengths: keep the v1 header mask
+                    grammar = None
+                    _log("[qwen35] headers tokenise to non-uniform lengths; "
+                         "using the v1 header mask for this target")
+
+            pbar = comfy.utils.ProgressBar(limit) if comfy is not None else None
+            stream = stream_preview and comfy is not None
+            state = {"n": 0, "ids": []}
+
+            def on_token(tok_id):
+                state["n"] += 1
+                if pbar is not None:
+                    pbar.update(1)
+                if stream:
+                    state["ids"].append(tok_id)
+                    if state["n"] % 8 == 0:
+                        _stream_preview(tok, state["ids"][-256:])
+
+            gen_kw = dict(
+                max_new_tokens=limit,
+                temperature=float(temperature),
+                top_k=int(top_k),
+                top_p=float(top_p),
+                seed=int(seed),
+                stop_ids=stop,
+                min_p=float(min_p),
+                repetition_penalty=float(repetition_penalty),
+                presence_penalty=float(presence_penalty),
+                prefix_len=prefix_len,
+                header_mask=mask,
+                newline_id=newline_id,
+                line_grammar=grammar,
+            )
+            if image_payload is not None:
+                gen_kw["image_embds"] = image_payload["image_embds"]
+                gen_kw["image_span"] = image_payload["image_span"]
                 if int(best_of) > 1:
-                    rows = eng.generate_batch(ids, n=int(best_of), on_token=None,
-                                              **gen_kw)
-                    texts = [postprocess(tok.decode(r).strip(), tgt)
-                             for r in rows]
-                    winner, scores = score_candidates(
-                        texts, keywords_of(text), budget=budget,
-                        headers=tgt.get("headers") or None, tok=tok)
-                    result = texts[winner]
-                    token_count = len(tok.encode(result)) if result else 0
-                    warnings = []
-                    if budget and token_count > budget:
-                        warnings.append(
-                            f"best candidate is {token_count} tokens, over the "
-                            f"{budget}-token target budget")
-                    report = {"winner": winner, "n": len(texts),
-                              "scores": scores, "warnings": warnings}
-                    _log(f"[qwen35] winner={winner} "
-                         + " ".join(f"{s['index']}:{s['score']}" for s in scores))
-                else:
-                    out_ids, warnings = eng.generate(
-                        ids, on_token=on_token, **gen_kw)
-                    result = postprocess(tok.decode(out_ids).strip(), tgt)
-                    token_count = len(tok.encode(result)) if result else 0
-                    if budget and token_count > budget:
-                        warnings.append(
-                            f"generated prompt is {token_count} tokens, over the "
-                            f"{budget}-token target budget")
-                    report = {"winner": 0, "n": 1, "scores": [],
-                              "warnings": warnings}
-            for w in warnings:
-                _log(f"[qwen35] warning: {w}")
+                    _log("[qwen35] best_of>1 is not supported with an image; "
+                         "generating a single candidate")
+                    best_of = 1
+            try:
+                with torch.inference_mode():
+                    if int(best_of) > 1:
+                        rows = eng.generate_batch(ids, n=int(best_of), on_token=None,
+                                                  **gen_kw)
+                        texts = [postprocess(tok.decode(r).strip(), tgt)
+                                 for r in rows]
+                        (winner, scores, crit) = score_candidates(
+                            texts, preserved, budget=budget,
+                            headers=tgt.get("headers") or None, tok=tok,
+                            require_all=bool(preserved))
+                        result = texts[winner]
+                        token_count = len(tok.encode(result)) if result else 0
+                        warnings = []
+                        if crit["all_miss"]:
+                            warnings.append(
+                                "all candidates missed at least one preserved "
+                                f"keyword; best coverage was "
+                                f"{max(s['coverage'] for s in scores):.2f} — "
+                                "try raising best_of")
+                        err = [s for s in scores
+                               if s["index"] != winner and s["missing"]]
+                        if err:
+                            _log(f"[qwen35] dropped keywords in {len(err)} "
+                                 f"candidate(s): "
+                                 + "; ".join(f"#{s['index'] + 1} {s['missing']}"
+                                            for s in err))
+                        if budget and token_count > budget:
+                            warnings.append(
+                                f"best candidate is {token_count} tokens, over the "
+                                f"{budget}-token target budget")
+                        report = {"winner": winner, "n": len(texts),
+                                  "scores": scores, "warnings": warnings,
+                                  "preserved": preserved,
+                                  "missing": scores[winner]["missing"]}
+                        _log(f"[qwen35] winner={winner} "
+                             + " ".join(f"{s['index']}:{s['score']}" for s in scores)
+                             + (f" missing={scores[winner]['missing']}"
+                                if scores[winner]["missing"] else ""))
+                    else:
+                        out_ids, warnings = eng.generate(
+                            ids, on_token=on_token, **gen_kw)
+                        result = postprocess(tok.decode(out_ids).strip(), tgt)
+                        token_count = len(tok.encode(result)) if result else 0
+                        if budget and token_count > budget:
+                            warnings.append(
+                                f"generated prompt is {token_count} tokens, over the "
+                                f"{budget}-token target budget")
+                        from .targets import present_keywords
+                        _hits, _miss = present_keywords(result, preserved)
+                        if _miss:
+                            warnings.append(
+                                f"output dropped preserved keyword(s): {_miss} — "
+                                "single-candidate path is warn-only; "
+                                "try raising best_of")
+                        report = {"winner": 0, "n": 1, "scores": [],
+                                  "warnings": warnings,
+                                  "preserved": preserved,
+                                  "missing": _miss,
+                                  "images": len(image_payload["image_span"])
+                                  if image_payload else 0}
+                for w in warnings:
+                    _log(f"[qwen35] warning: {w}")
+            finally:
+                if memory_mode == "offload_after_run":
+                    with _lock:
+                        eng.offload()
+
+            import json
+            warn_txt = json.dumps(report, ensure_ascii=False, sort_keys=True)
+            return {"ui": {"text": [result, *warnings]},
+                    "result": (result, token_count, warn_txt)}
         finally:
             if memory_mode == "offload_after_run":
                 with _lock:
                     eng.offload()
-
-        import json
-        warn_txt = json.dumps(report, ensure_ascii=False, sort_keys=True)
-        return {"ui": {"text": [result, *warnings]},
-                "result": (result, token_count, warn_txt)}
 
 
 NODE_CLASS_MAPPINGS = {

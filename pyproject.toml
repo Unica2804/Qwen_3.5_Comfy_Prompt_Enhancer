@@ -1,7 +1,7 @@
 [project]
 name = "qwen35-prompt-enhancer"
 version = "0.1.0"
-description = "Add your description here"
+description = "ComfyUI custom node that turns a short idea into a detailed text-to-image prompt with a local Qwen3.5 checkpoint (INT8 Triton engine)"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = []
